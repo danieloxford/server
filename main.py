@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
-import tensorflow as tf
+import tflite_runtime.interpreter as tflite
 import os
 from groq import Groq
 from dotenv import load_dotenv
@@ -38,7 +38,7 @@ GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 # =========================
 # Load TFLite model (for OFFLINE mode + PRE-SCREENING)
 # =========================
-interpreter = tf.lite.Interpreter(model_path="model_unquant.tflite")
+interpreter = tflite.Interpreter(model_path="model_unquant.tflite")
 interpreter.allocate_tensors()
 
 input_details  = interpreter.get_input_details()[0]
