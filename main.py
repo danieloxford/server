@@ -5,7 +5,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
-import tensorflow as tf
 import os
 from groq import Groq
 from dotenv import load_dotenv
@@ -17,6 +16,26 @@ import socket
 import base64 as b64lib
 
 load_dotenv()
+
+# =========================
+# TFLite Runtime
+# Prefers lightweight 'tflite-runtime' (pip install tflite-runtime).
+# Falls back to full 'tensorflow' if tflite-runtime is not installed.
+# On deployment (Railway / Render / Fly) use ONLY tflite-runtime in
+# requirements.txt to avoid the ~500 MB tensorflow wheel.
+# =========================
+try:
+    import tflite_runtime.interpreter as tflite
+    _Interpreter = tflite.Interpreter
+    print("[OK]   TFLite runtime loaded  (tflite-runtime)")
+except ImportError:
+    try:
+        import tensorflow as tf
+        _Interpreter = tf.lite.Interpreter
+        print("[OK]   TFLite runtime loaded  (tensorflow fallback)")
+    except ImportError:
+        _Interpreter = None
+        print("[WARN] No TFLite runtime found — offline classify unavailable")
 
 # =========================
 # AI CHAT (Groq)
@@ -31,18 +50,36 @@ GEMINI_MODEL   = "gemini-2.5-flash-lite"
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
 # =========================
-# Load TFLite model (for OFFLINE mode + PRE-SCREENING)
+# Load TFLite model + labels
+# Both are optional — server starts even if files are missing.
 # =========================
-interpreter = tf.lite.Interpreter(model_path="model_unquant.tflite")
-interpreter.allocate_tensors()
+interpreter    = None
+input_details  = None
+output_details = None
+labels         = []
 
-input_details  = interpreter.get_input_details()[0]
-output_details = interpreter.get_output_details()[0]
+if _Interpreter is not None:
+    try:
+        interpreter = _Interpreter(model_path="model_unquant.tflite")
+        interpreter.allocate_tensors()
+        input_details  = interpreter.get_input_details()[0]
+        output_details = interpreter.get_output_details()[0]
+        print("[OK]   TFLite model loaded    (model_unquant.tflite)")
+    except Exception as e:
+        interpreter = None
+        print(f"[WARN] Could not load TFLite model: {e}")
 
-# Load labels
-with open("labels.txt") as f:
-    labels = [line.strip() for line in f.readlines()]
+try:
+    with open("labels.txt") as f:
+        labels = [line.strip() for line in f.readlines()]
+    print(f"[OK]   Labels loaded          ({len(labels)} classes)")
+except FileNotFoundError:
+    labels = []
+    print("[WARN] labels.txt not found — offline classify unavailable")
 
+# =========================
+# App
+# =========================
 app = FastAPI(title="DermAware Backend v3.3")
 
 app.add_middleware(
@@ -53,7 +90,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static files (UI)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # =========================
@@ -103,6 +139,11 @@ def normalize_label(label: str) -> str:
 # TFLite Pre-screen
 # =========================
 def tflite_prescreen(image: Image.Image) -> dict:
+    # No runtime available — skip pre-screen and allow request through
+    if interpreter is None:
+        print("[WARN] TFLite unavailable — skipping pre-screen")
+        return { "passed": True, "confidence": 0.0 }
+
     try:
         input_data = preprocess_image(image)
         interpreter.set_tensor(input_details["index"], input_data)
@@ -218,7 +259,7 @@ async def verify_gcash_screenshot(req: GcashVerifyRequest):
     if raw_b64.startswith("data:"):
         raw_b64 = raw_b64.split(",", 1)[-1]
 
-    print(f"[PAY]  GCash verify request | amount={req.expected_amount} | mime={safe_mime}")
+    print(f"[PAY]  GCash verify | amount={req.expected_amount} | mime={safe_mime}")
 
     try:
         payload = {
@@ -444,6 +485,9 @@ async def classify_gemini(file: UploadFile = File(...)):
 # =========================
 @app.post("/classify/offline")
 async def classify_offline(file: UploadFile = File(...)):
+    if interpreter is None:
+        raise HTTPException(503, "Offline classifier unavailable — tflite-runtime not installed on this server.")
+
     try:
         print(f"[SCAN] Offline classify | file={file.filename}")
 
@@ -466,13 +510,13 @@ async def classify_offline(file: UploadFile = File(...)):
         normalized = normalize_label(raw_label)
 
         if confidence < NOT_SKIN_THRESHOLD:
-            return JSONResponse({ "label": "Not Skin", "confidence": confidence, "error": "low_confidence" })
+            return JSONResponse({ "label": "Not Skin",    "confidence": confidence, "error": "low_confidence" })
         if normalized == "not_skin":
-            return JSONResponse({ "label": "Not Skin", "confidence": confidence, "error": "not_skin" })
+            return JSONResponse({ "label": "Not Skin",    "confidence": confidence, "error": "not_skin" })
         if normalized == "healthy":
-            return JSONResponse({ "label": "Healthy Skin", "confidence": confidence })
+            return JSONResponse({ "label": "Healthy Skin","confidence": confidence })
         if confidence < CONFIDENCE_THRESHOLD:
-            return JSONResponse({ "label": normalized, "confidence": confidence, "warning": "low_confidence_result" })
+            return JSONResponse({ "label": normalized,    "confidence": confidence, "warning": "low_confidence_result" })
 
         return JSONResponse({ "label": normalized, "confidence": confidence })
 
@@ -549,6 +593,9 @@ def chat(req: ChatRequest):
         raise HTTPException(500, f"Chat failed: {str(e)}")
 
 
+# =========================
+# EXPLAIN RESULT
+# =========================
 class ExplainRequest(BaseModel):
     label: str
 
@@ -607,6 +654,9 @@ def explain_result(req: ExplainRequest):
         raise HTTPException(500, f"Explanation failed: {str(e)}")
 
 
+# =========================
+# HEALTH / DEBUG
+# =========================
 @app.get("/")
 def health():
     return {
@@ -620,9 +670,9 @@ def health():
             "Scientific + Popular Names via Groq",
             "AI Chat (Groq)",
         ],
-        "gemini": "OK"      if GEMINI_API_KEY            else "MISSING",
-        "groq":   "OK"      if os.getenv("GROQ_API_KEY") else "MISSING",
-        "tflite": "OK",
+        "gemini": "OK"          if GEMINI_API_KEY            else "MISSING",
+        "groq":   "OK"          if os.getenv("GROQ_API_KEY") else "MISSING",
+        "tflite": "OK"          if interpreter is not None   else "UNAVAILABLE",
         "model_classes": len(labels),
         "endpoints": {
             "health":          "GET  /",
@@ -649,10 +699,11 @@ def ui():
 @app.get("/debug")
 def debug():
     return {
-        "gemini_key":   "OK - Set" if GEMINI_API_KEY            else "MISSING",
-        "groq_key":     "OK - Set" if os.getenv("GROQ_API_KEY") else "MISSING",
+        "gemini_key":   "OK - Set"   if GEMINI_API_KEY            else "MISSING",
+        "groq_key":     "OK - Set"   if os.getenv("GROQ_API_KEY") else "MISSING",
+        "tflite":       "OK"         if interpreter is not None   else "UNAVAILABLE - add tflite-runtime to requirements.txt",
         "labels_count": len(labels),
-        "sample_labels": labels[:5],
+        "sample_labels":labels[:5],
     }
 
 
@@ -662,13 +713,14 @@ def debug():
 if __name__ == "__main__":
     import uvicorn
     local_ip = get_local_ip()
+    tflite_status = f"[OK] ({len(labels)} classes)" if interpreter else "[UNAVAILABLE] install tflite-runtime"
     print("=" * 52)
     print("  DermAware Backend v3.3")
     print("=" * 52)
     print(f"  Local Network : http://{local_ip}:8000")
     print(f"  Localhost     : http://127.0.0.1:8000")
-    print(f"  Gemini        : {'[OK]' if GEMINI_API_KEY else '[MISSING] GEMINI_API_KEY not set'}")
-    print(f"  Groq          : {'[OK]' if os.getenv('GROQ_API_KEY') else '[MISSING] GROQ_API_KEY not set'}")
-    print(f"  TFLite        : [OK] ({len(labels)} classes)")
+    print(f"  Gemini        : {'[OK]' if GEMINI_API_KEY else '[MISSING] set GEMINI_API_KEY'}")
+    print(f"  Groq          : {'[OK]' if os.getenv('GROQ_API_KEY') else '[MISSING] set GROQ_API_KEY'}")
+    print(f"  TFLite        : {tflite_status}")
     print("=" * 52)
     uvicorn.run(app, host="0.0.0.0", port=8000)
