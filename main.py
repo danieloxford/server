@@ -18,7 +18,6 @@ import base64 as b64lib
 
 load_dotenv()
 
-
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
