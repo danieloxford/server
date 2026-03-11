@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
+import tensorflow as tf
 import os
 from groq import Groq
 from dotenv import load_dotenv
@@ -17,69 +18,22 @@ import base64 as b64lib
 
 load_dotenv()
 
-# =========================
-# TFLite Runtime
-# Prefers lightweight 'tflite-runtime' (pip install tflite-runtime).
-# Falls back to full 'tensorflow' if tflite-runtime is not installed.
-# On deployment (Railway / Render / Fly) use ONLY tflite-runtime in
-# requirements.txt to avoid the ~500 MB tensorflow wheel.
-# =========================
-try:
-    import tflite_runtime.interpreter as tflite
-    _Interpreter = tflite.Interpreter
-    print("[OK]   TFLite runtime loaded  (tflite-runtime)")
-except ImportError:
-    try:
-        import tensorflow as tf
-        _Interpreter = tf.lite.Interpreter
-        print("[OK]   TFLite runtime loaded  (tensorflow fallback)")
-    except ImportError:
-        _Interpreter = None
-        print("[WARN] No TFLite runtime found — offline classify unavailable")
 
-# =========================
-# AI CHAT (Groq)
-# =========================
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# =========================
-# GEMINI CONFIG
-# =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL   = "gemini-2.5-flash-lite"
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
-# =========================
-# Load TFLite model + labels
-# Both are optional — server starts even if files are missing.
-# =========================
-interpreter    = None
-input_details  = None
-output_details = None
-labels         = []
+interpreter = tf.lite.Interpreter(model_path="model_unquant.tflite")
+interpreter.allocate_tensors()
 
-if _Interpreter is not None:
-    try:
-        interpreter = _Interpreter(model_path="model_unquant.tflite")
-        interpreter.allocate_tensors()
-        input_details  = interpreter.get_input_details()[0]
-        output_details = interpreter.get_output_details()[0]
-        print("[OK]   TFLite model loaded    (model_unquant.tflite)")
-    except Exception as e:
-        interpreter = None
-        print(f"[WARN] Could not load TFLite model: {e}")
+input_details  = interpreter.get_input_details()[0]
+output_details = interpreter.get_output_details()[0]
 
-try:
-    with open("labels.txt") as f:
-        labels = [line.strip() for line in f.readlines()]
-    print(f"[OK]   Labels loaded          ({len(labels)} classes)")
-except FileNotFoundError:
-    labels = []
-    print("[WARN] labels.txt not found — offline classify unavailable")
+with open("labels.txt") as f:
+    labels = [line.strip() for line in f.readlines()]
 
-# =========================
-# App
-# =========================
 app = FastAPI(title="DermAware Backend v3.3")
 
 app.add_middleware(
@@ -92,9 +46,6 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# =========================
-# Thresholds
-# =========================
 CONFIDENCE_THRESHOLD = 0.40
 NOT_SKIN_THRESHOLD   = 0.30
 
@@ -108,9 +59,6 @@ NOT_SKIN_LABELS = {
     "no skin", "other"
 }
 
-# =========================
-# Utils
-# =========================
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -135,15 +83,7 @@ def normalize_label(label: str) -> str:
         return "not_skin"
     return label.replace("-", " ").replace("_", " ").title()
 
-# =========================
-# TFLite Pre-screen
-# =========================
 def tflite_prescreen(image: Image.Image) -> dict:
-    # No runtime available — skip pre-screen and allow request through
-    if interpreter is None:
-        print("[WARN] TFLite unavailable — skipping pre-screen")
-        return { "passed": True, "confidence": 0.0 }
-
     try:
         input_data = preprocess_image(image)
         interpreter.set_tensor(input_details["index"], input_data)
@@ -194,11 +134,9 @@ def get_skin_info_from_groq(label: str):
                     "role": "system",
                     "content": (
                         "You are a dermatology assistant. "
-                        "IMPORTANT: Use the MOST POPULAR, COMMON English name that regular people use - NOT scientific/medical terms. "
-                        "For example: 'Ringworm' NOT 'Tinea Corporis', 'Athlete's Foot' NOT 'Tinea Pedis', "
-                        "'Cold Sore' NOT 'Herpes Simplex', 'Hives' NOT 'Urticaria', etc.\n\n"
                         "Provide info in JSON format:\n"
-                        "- alsoKnownAs: The MOST POPULAR common English name people actually use (NOT medical/scientific term)\n"
+                        "- alsoKnownAs: The SHORTEST, SIMPLEST single name only — no slashes, no extra words, no medical terms. "
+                        "One word or two at most. Examples: 'Acne', 'Ringworm', 'Warts', 'Moles', 'Hives', 'Eczema', 'Psoriasis'.\n"
                         "- explanation: 2-3 sentences simple definition in everyday English\n"
                         "- causes: 3-5 common causes in simple language\n"
                         "- dos: 3-5 care recommendations in simple, actionable language\n"
@@ -208,7 +146,7 @@ def get_skin_info_from_groq(label: str):
                 },
                 {
                     "role": "user",
-                    "content": f"What is the most popular common name for '{label}' and explain this skin condition in simple terms."
+                    "content": f"What is the simplest common name for '{label}' and explain this skin condition in simple terms."
                 }
             ],
             response_format={"type": "json_object"}
@@ -232,11 +170,6 @@ def get_skin_info_from_groq(label: str):
             "donts":       []
         }
 
-
-# =========================
-# GCASH SCREENSHOT VERIFICATION
-# API key stays server-side — never exposed to the mobile app
-# =========================
 class GcashVerifyRequest(BaseModel):
     image_base64:    str
     mime_type:       str = "image/jpeg"
@@ -254,12 +187,11 @@ async def verify_gcash_screenshot(req: GcashVerifyRequest):
     SUPPORTED_MIME = ["image/jpeg", "image/png", "image/gif", "image/webp"]
     safe_mime = req.mime_type if req.mime_type in SUPPORTED_MIME else "image/jpeg"
 
-    # Strip data URI prefix if present
     raw_b64 = req.image_base64
     if raw_b64.startswith("data:"):
         raw_b64 = raw_b64.split(",", 1)[-1]
 
-    print(f"[PAY]  GCash verify | amount={req.expected_amount} | mime={safe_mime}")
+    print(f"[PAY]  GCash verify request | amount={req.expected_amount} | mime={safe_mime}")
 
     try:
         payload = {
@@ -338,11 +270,6 @@ async def verify_gcash_screenshot(req: GcashVerifyRequest):
         print(f"[ERROR] GCash verify exception: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Verification failed: {str(e)}")
 
-
-# =========================
-# GEMINI SKIN CLASSIFICATION
-# API key stays server-side — never exposed to the mobile app
-# =========================
 @app.post("/classify/gemini")
 async def classify_gemini(file: UploadFile = File(...)):
     """
@@ -382,7 +309,7 @@ async def classify_gemini(file: UploadFile = File(...)):
             "{\n"
             "  \"type\": \"CONDITION\",\n"
             "  \"label\": \"Precise medical condition name\",\n"
-            "  \"alsoKnownAs\": \"Most popular common name regular people use\",\n"
+            "  \"alsoKnownAs\": \"Shortest simplest everyday word only\",\n"
             "  \"confidence\": 0.85,\n"
             "  \"severity\": \"mild|moderate|severe\",\n"
             "  \"explanation\": \"2-3 sentence patient-friendly explanation\",\n"
@@ -396,7 +323,10 @@ async def classify_gemini(file: UploadFile = File(...)):
             "--- RULES ---\n"
             "- ANY human body part -> never NOT_SKIN\n"
             "- When unsure between HEALTHY and CONDITION -> always CONDITION\n"
-            "- alsoKnownAs: use the most popular everyday name people actually use (e.g. 'Ringworm' not 'Tinea Corporis')\n"
+            "- alsoKnownAs: use ONLY the shortest, simplest everyday word people say — just the condition name, nothing else. "
+            "Examples: 'Acne' not 'Acne & Rosacea', 'Moles' not 'Melanoma / Suspicious Mole', 'Ringworm' not 'Ringworm / Fungal Infection', "
+            "'Warts' not 'Warts / Viral Infection', 'Eczema' not 'Atopic Dermatitis', 'Hives' not 'Urticaria'. "
+            "No slashes, no extra context, no medical terms. One or two words maximum.\n"
             "- confidence: 0.0-1.0 (your honest estimate)\n"
             "- severity: mild (minor, self-manageable), moderate (needs attention), severe (urgent care needed)\n"
             "- symptoms/causes/dos/donts: 3-6 items each, specific and actionable\n"
@@ -429,7 +359,6 @@ async def classify_gemini(file: UploadFile = File(...)):
         data  = response.json()
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
 
-        # Filter out thinking parts, get last text part
         raw_text = (
             next((p["text"] for p in reversed(parts) if not p.get("thought") and "text" in p), None)
             or (parts[-1].get("text", "") if parts else "")
@@ -479,15 +408,8 @@ async def classify_gemini(file: UploadFile = File(...)):
         print(f"[ERROR] Gemini classify exception: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Gemini classification failed: {str(e)}")
 
-
-# =========================
-# OFFLINE: TFLite Direct Classifier
-# =========================
 @app.post("/classify/offline")
 async def classify_offline(file: UploadFile = File(...)):
-    if interpreter is None:
-        raise HTTPException(503, "Offline classifier unavailable — tflite-runtime not installed on this server.")
-
     try:
         print(f"[SCAN] Offline classify | file={file.filename}")
 
@@ -510,13 +432,13 @@ async def classify_offline(file: UploadFile = File(...)):
         normalized = normalize_label(raw_label)
 
         if confidence < NOT_SKIN_THRESHOLD:
-            return JSONResponse({ "label": "Not Skin",    "confidence": confidence, "error": "low_confidence" })
+            return JSONResponse({ "label": "Not Skin", "confidence": confidence, "error": "low_confidence" })
         if normalized == "not_skin":
-            return JSONResponse({ "label": "Not Skin",    "confidence": confidence, "error": "not_skin" })
+            return JSONResponse({ "label": "Not Skin", "confidence": confidence, "error": "not_skin" })
         if normalized == "healthy":
-            return JSONResponse({ "label": "Healthy Skin","confidence": confidence })
+            return JSONResponse({ "label": "Healthy Skin", "confidence": confidence })
         if confidence < CONFIDENCE_THRESHOLD:
-            return JSONResponse({ "label": normalized,    "confidence": confidence, "warning": "low_confidence_result" })
+            return JSONResponse({ "label": normalized, "confidence": confidence, "warning": "low_confidence_result" })
 
         return JSONResponse({ "label": normalized, "confidence": confidence })
 
@@ -526,9 +448,6 @@ async def classify_offline(file: UploadFile = File(...)):
         raise HTTPException(500, f"Offline failed: {str(e)}")
 
 
-# =========================
-# UNIFIED ENDPOINT
-# =========================
 @app.post("/classify")
 async def classify_unified(file: UploadFile = File(...), mode: str = Form("gemini")):
     print(f"[ROUTE] Mode: {mode}")
@@ -538,9 +457,6 @@ async def classify_unified(file: UploadFile = File(...), mode: str = Form("gemin
         return await classify_offline(file)
 
 
-# =========================
-# AI CHAT — With Conversation History
-# =========================
 class ChatRequest(BaseModel):
     message: str
     history: list = []
@@ -593,9 +509,6 @@ def chat(req: ChatRequest):
         raise HTTPException(500, f"Chat failed: {str(e)}")
 
 
-# =========================
-# EXPLAIN RESULT
-# =========================
 class ExplainRequest(BaseModel):
     label: str
 
@@ -654,9 +567,6 @@ def explain_result(req: ExplainRequest):
         raise HTTPException(500, f"Explanation failed: {str(e)}")
 
 
-# =========================
-# HEALTH / DEBUG
-# =========================
 @app.get("/")
 def health():
     return {
@@ -670,9 +580,9 @@ def health():
             "Scientific + Popular Names via Groq",
             "AI Chat (Groq)",
         ],
-        "gemini": "OK"          if GEMINI_API_KEY            else "MISSING",
-        "groq":   "OK"          if os.getenv("GROQ_API_KEY") else "MISSING",
-        "tflite": "OK"          if interpreter is not None   else "UNAVAILABLE",
+        "gemini": "OK"      if GEMINI_API_KEY            else "MISSING",
+        "groq":   "OK"      if os.getenv("GROQ_API_KEY") else "MISSING",
+        "tflite": "OK",
         "model_classes": len(labels),
         "endpoints": {
             "health":          "GET  /",
@@ -699,28 +609,24 @@ def ui():
 @app.get("/debug")
 def debug():
     return {
-        "gemini_key":   "OK - Set"   if GEMINI_API_KEY            else "MISSING",
-        "groq_key":     "OK - Set"   if os.getenv("GROQ_API_KEY") else "MISSING",
-        "tflite":       "OK"         if interpreter is not None   else "UNAVAILABLE - add tflite-runtime to requirements.txt",
+        "gemini_key":   "OK - Set" if GEMINI_API_KEY            else "MISSING",
+        "groq_key":     "OK - Set" if os.getenv("GROQ_API_KEY") else "MISSING",
         "labels_count": len(labels),
-        "sample_labels":labels[:5],
+        "sample_labels": labels[:5],
     }
 
 
-# =========================
-# RUN
-# =========================
+
 if __name__ == "__main__":
     import uvicorn
     local_ip = get_local_ip()
-    tflite_status = f"[OK] ({len(labels)} classes)" if interpreter else "[UNAVAILABLE] install tflite-runtime"
     print("=" * 52)
     print("  DermAware Backend v3.3")
     print("=" * 52)
     print(f"  Local Network : http://{local_ip}:8000")
     print(f"  Localhost     : http://127.0.0.1:8000")
-    print(f"  Gemini        : {'[OK]' if GEMINI_API_KEY else '[MISSING] set GEMINI_API_KEY'}")
-    print(f"  Groq          : {'[OK]' if os.getenv('GROQ_API_KEY') else '[MISSING] set GROQ_API_KEY'}")
-    print(f"  TFLite        : {tflite_status}")
+    print(f"  Gemini        : {'[OK]' if GEMINI_API_KEY else '[MISSING] GEMINI_API_KEY not set'}")
+    print(f"  Groq          : {'[OK]' if os.getenv('GROQ_API_KEY') else '[MISSING] GROQ_API_KEY not set'}")
+    print(f"  TFLite        : [OK] ({len(labels)} classes)")
     print("=" * 52)
     uvicorn.run(app, host="0.0.0.0", port=8000)
