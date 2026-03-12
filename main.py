@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
+import tensorflow as tf
 import os
 from groq import Groq
 from dotenv import load_dotenv
@@ -18,29 +19,14 @@ import base64 as b64lib
 load_dotenv()
 
 # =========================
-# TFLite Runtime
-# Prefers lightweight 'tflite-runtime' (pip install tflite-runtime).
-# Falls back to full 'tensorflow' if tflite-runtime is not installed.
-# On deployment (Railway / Render / Fly) use ONLY tflite-runtime in
-# requirements.txt to avoid the ~500 MB tensorflow wheel.
-# =========================
-try:
-    import tflite_runtime.interpreter as tflite
-    _Interpreter = tflite.Interpreter
-    print("[OK]   TFLite runtime loaded  (tflite-runtime)")
-except ImportError:
-    try:
-        import tensorflow as tf
-        _Interpreter = tf.lite.Interpreter
-        print("[OK]   TFLite runtime loaded  (tensorflow fallback)")
-    except ImportError:
-        _Interpreter = None
-        print("[WARN] No TFLite runtime found — offline classify unavailable")
-
-# =========================
 # AI CHAT (Groq)
 # =========================
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# =========================
+# AILABTOOLS CONFIG
+# =========================
+AILABTOOLS_API_KEY = os.getenv("AILABTOOLS_API_KEY")
 
 # =========================
 # GEMINI CONFIG
@@ -50,37 +36,19 @@ GEMINI_MODEL   = "gemini-2.5-flash-lite"
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
 # =========================
-# Load TFLite model + labels
-# Both are optional — server starts even if files are missing.
+# Load TFLite model (for OFFLINE mode + PRE-SCREENING)
 # =========================
-interpreter    = None
-input_details  = None
-output_details = None
-labels         = []
+interpreter = tf.lite.Interpreter(model_path="model_unquant.tflite")
+interpreter.allocate_tensors()
 
-if _Interpreter is not None:
-    try:
-        interpreter = _Interpreter(model_path="model_unquant.tflite")
-        interpreter.allocate_tensors()
-        input_details  = interpreter.get_input_details()[0]
-        output_details = interpreter.get_output_details()[0]
-        print("[OK]   TFLite model loaded    (model_unquant.tflite)")
-    except Exception as e:
-        interpreter = None
-        print(f"[WARN] Could not load TFLite model: {e}")
+input_details  = interpreter.get_input_details()[0]
+output_details = interpreter.get_output_details()[0]
 
-try:
-    with open("labels.txt") as f:
-        labels = [line.strip() for line in f.readlines()]
-    print(f"[OK]   Labels loaded          ({len(labels)} classes)")
-except FileNotFoundError:
-    labels = []
-    print("[WARN] labels.txt not found — offline classify unavailable")
+# Load labels
+with open("labels.txt") as f:
+    labels = [line.strip() for line in f.readlines()]
 
-# =========================
-# App
-# =========================
-app = FastAPI(title="DermAware Backend v3.3")
+app = FastAPI(title="DermAware Backend v3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,6 +58,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Static files (UI)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # =========================
@@ -139,11 +108,6 @@ def normalize_label(label: str) -> str:
 # TFLite Pre-screen
 # =========================
 def tflite_prescreen(image: Image.Image) -> dict:
-    # No runtime available — skip pre-screen and allow request through
-    if interpreter is None:
-        print("[WARN] TFLite unavailable — skipping pre-screen")
-        return { "passed": True, "confidence": 0.0 }
-
     try:
         input_data = preprocess_image(image)
         interpreter.set_tensor(input_details["index"], input_data)
@@ -151,9 +115,9 @@ def tflite_prescreen(image: Image.Image) -> dict:
         output_data = interpreter.get_tensor(output_details["index"])[0]
 
         top3_idx = np.argsort(output_data)[::-1][:3]
-        print("[SCAN] TFLite pre-screen top-3:")
+        print("🔍 TFLite pre-screen top-3:")
         for idx in top3_idx:
-            print(f"       [{idx}] {labels[idx]}: {output_data[idx]:.2%}")
+            print(f"   [{idx}] {labels[idx]}: {output_data[idx]:.2%}")
 
         max_idx    = int(np.argmax(output_data))
         raw_label  = labels[max_idx]
@@ -176,17 +140,17 @@ def tflite_prescreen(image: Image.Image) -> dict:
                 "confidence": confidence
             }
 
-        print(f"[OK]   Pre-screen PASSED ({confidence:.2%})")
+        print(f"✅ Pre-screen PASSED ({confidence:.2%})")
         return { "passed": True, "confidence": confidence }
 
     except Exception as e:
-        print(f"[WARN] TFLite pre-screen error (allowing API anyway): {e}")
+        print(f"⚠️ TFLite pre-screen error (allowing API anyway): {e}")
         return { "passed": True, "confidence": 0.0 }
 
 
-def get_skin_info_from_groq(label: str):
+def get_skin_info_from_openai(label: str):
     try:
-        print(f"[AI]   Asking Groq for details about: {label}")
+        print(f"🤖 Asking Groq for details about: {label}")
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -223,7 +187,7 @@ def get_skin_info_from_groq(label: str):
             "donts":       data.get("donts", [])
         }
     except Exception as e:
-        print(f"[ERROR] Groq info fetch failed: {e}")
+        print(f"❌ Error getting Groq info: {e}")
         return {
             "alsoKnownAs": label,
             "explanation": "Information currently unavailable.",
@@ -234,114 +198,8 @@ def get_skin_info_from_groq(label: str):
 
 
 # =========================
-# GCASH SCREENSHOT VERIFICATION
-# API key stays server-side — never exposed to the mobile app
-# =========================
-class GcashVerifyRequest(BaseModel):
-    image_base64:    str
-    mime_type:       str = "image/jpeg"
-    expected_amount: str
-
-@app.post("/verify/gcash-screenshot")
-async def verify_gcash_screenshot(req: GcashVerifyRequest):
-    """
-    Verifies a GCash payment screenshot using Gemini Vision.
-    The mobile app sends the image here; the API key never leaves the server.
-    """
-    if not GEMINI_API_KEY:
-        raise HTTPException(500, "GEMINI_API_KEY not configured on server")
-
-    SUPPORTED_MIME = ["image/jpeg", "image/png", "image/gif", "image/webp"]
-    safe_mime = req.mime_type if req.mime_type in SUPPORTED_MIME else "image/jpeg"
-
-    # Strip data URI prefix if present
-    raw_b64 = req.image_base64
-    if raw_b64.startswith("data:"):
-        raw_b64 = raw_b64.split(",", 1)[-1]
-
-    print(f"[PAY]  GCash verify | amount={req.expected_amount} | mime={safe_mime}")
-
-    try:
-        payload = {
-            "contents": [{"parts": [
-                {
-                    "inline_data": {
-                        "mime_type": safe_mime,
-                        "data": raw_b64
-                    }
-                },
-                {
-                    "text": (
-                        f"You are a payment verification assistant. "
-                        f"Analyze this GCash screenshot. Expected amount: {req.expected_amount}. "
-                        f"Check: (1) Is this a genuine GCash transaction receipt? "
-                        f"(2) What is the reference number? "
-                        f"(3) What amount was sent? "
-                        f"(4) Does it match {req.expected_amount}? "
-                        f"Respond ONLY with a raw JSON object — no markdown, no backticks, no extra text: "
-                        f'{{ "isGcash": boolean, "confidence": "high"|"medium"|"low", '
-                        f'"extractedRef": string|null, "extractedAmount": string|null, '
-                        f'"amountMatches": boolean|null, "reason": string }}'
-                    )
-                },
-            ]}],
-            "generationConfig": {
-                "temperature":     0,
-                "maxOutputTokens": 300
-            }
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            response = await http.post(GEMINI_URL, json=payload)
-
-        if response.status_code != 200:
-            print(f"[ERROR] Gemini responded {response.status_code} — {response.text[:300]}")
-            raise HTTPException(response.status_code, f"Gemini API error: {response.text[:200]}")
-
-        data    = response.json()
-        raw     = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        cleaned = raw.replace("```json", "").replace("```", "").strip()
-        result  = json.loads(cleaned)
-
-        print(
-            f"[OK]   GCash verify done | "
-            f"isGcash={result.get('isGcash')} | "
-            f"confidence={result.get('confidence')} | "
-            f"ref={result.get('extractedRef')} | "
-            f"amount={result.get('extractedAmount')}"
-        )
-
-        return JSONResponse({
-            "isGcash":         bool(result.get("isGcash", False)),
-            "confidence":      result.get("confidence", "low"),
-            "extractedRef":    result.get("extractedRef"),
-            "extractedAmount": result.get("extractedAmount"),
-            "amountMatches":   result.get("amountMatches"),
-            "reason":          result.get("reason", "")
-        })
-
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON parse failed (GCash verify): {e}")
-        return JSONResponse({
-            "isGcash":         False,
-            "confidence":      "low",
-            "extractedRef":    None,
-            "extractedAmount": None,
-            "amountMatches":   None,
-            "reason":          "Could not auto-verify. Admin will review manually."
-        })
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Gemini request timed out")
-    except httpx.RequestError as e:
-        raise HTTPException(503, f"Network error reaching Gemini: {str(e)}")
-    except Exception as e:
-        print(f"[ERROR] GCash verify exception: {e}\n{traceback.format_exc()}")
-        raise HTTPException(500, f"Verification failed: {str(e)}")
-
-
-# =========================
-# GEMINI SKIN CLASSIFICATION
-# API key stays server-side — never exposed to the mobile app
+# GEMINI CLASSIFICATION ENDPOINT
+# Keeps API key server-side — never exposed to the mobile app
 # =========================
 @app.post("/classify/gemini")
 async def classify_gemini(file: UploadFile = File(...)):
@@ -358,27 +216,27 @@ async def classify_gemini(file: UploadFile = File(...)):
         if len(contents) == 0:
             raise HTTPException(400, "Empty file received")
 
+        # Validate image
         try:
             Image.open(io.BytesIO(contents)).convert("RGB")
         except Exception as e:
             raise HTTPException(400, f"Invalid image: {str(e)}")
 
         image_b64 = b64lib.b64encode(contents).decode("utf-8")
-        print(f"[SCAN] Gemini classify | file={file.filename} | size={len(contents)} bytes")
 
         prompt = (
             "You are a professional AI dermatology screening assistant. "
             "Analyze this image carefully and respond ONLY in one of the following JSON formats — no markdown, no extra text.\n\n"
 
-            "--- FORMAT 1: Not human skin ---\n"
+            "━━━ FORMAT 1: Not human skin ━━━\n"
             "{\"type\":\"NOT_SKIN\",\"reason\":\"brief reason why this is not skin\"}\n\n"
             "Use ONLY when the image clearly shows: animals, food, objects, plants, text, or non-human material.\n\n"
 
-            "--- FORMAT 2: Healthy human skin ---\n"
+            "━━━ FORMAT 2: Healthy human skin ━━━\n"
             "{\"type\":\"HEALTHY\"}\n\n"
             "Use when you can clearly see human skin with NO visible condition, rash, lesion, discoloration, or abnormality.\n\n"
 
-            "--- FORMAT 3: Skin condition detected ---\n"
+            "━━━ FORMAT 3: Skin condition detected ━━━\n"
             "{\n"
             "  \"type\": \"CONDITION\",\n"
             "  \"label\": \"Precise medical condition name\",\n"
@@ -393,16 +251,16 @@ async def classify_gemini(file: UploadFile = File(...)):
             "  \"whenToSeeDoctor\": \"One clear sentence about when this specifically needs professional medical attention\"\n"
             "}\n\n"
 
-            "--- RULES ---\n"
-            "- ANY human body part -> never NOT_SKIN\n"
-            "- When unsure between HEALTHY and CONDITION -> always CONDITION\n"
-            "- alsoKnownAs: use the most popular everyday name people actually use (e.g. 'Ringworm' not 'Tinea Corporis')\n"
-            "- confidence: 0.0-1.0 (your honest estimate)\n"
-            "- severity: mild (minor, self-manageable), moderate (needs attention), severe (urgent care needed)\n"
-            "- symptoms/causes/dos/donts: 3-6 items each, specific and actionable\n"
-            "- explanation: simple language, avoid heavy jargon\n"
-            "- whenToSeeDoctor: be specific to this condition, not generic advice\n"
-            "- Reply ONLY valid JSON — no markdown fences, no preamble"
+            "━━━ RULES ━━━\n"
+            "• ANY human body part → never NOT_SKIN\n"
+            "• When unsure between HEALTHY and CONDITION → always CONDITION\n"
+            "• alsoKnownAs: use the most popular everyday name people actually use (e.g. 'Ringworm' not 'Tinea Corporis')\n"
+            "• confidence: 0.0–1.0 (your honest estimate)\n"
+            "• severity: mild (minor, self-manageable), moderate (needs attention), severe (urgent care needed)\n"
+            "• symptoms/causes/dos/donts: 3–6 items each, specific and actionable\n"
+            "• explanation: simple language, avoid heavy jargon\n"
+            "• whenToSeeDoctor: be specific to this condition, not generic advice\n"
+            "• Reply ONLY valid JSON — no markdown fences, no preamble"
         )
 
         payload = {
@@ -414,8 +272,8 @@ async def classify_gemini(file: UploadFile = File(...)):
             }],
             "generationConfig": {
                 "maxOutputTokens": 700,
-                "temperature":     0.1,
-                "thinkingConfig":  {"thinkingBudget": 0}
+                "temperature": 0.1,
+                "thinkingConfig": {"thinkingBudget": 0}
             }
         }
 
@@ -423,7 +281,7 @@ async def classify_gemini(file: UploadFile = File(...)):
             response = await http_client.post(GEMINI_URL, json=payload)
 
         if response.status_code != 200:
-            print(f"[ERROR] Gemini HTTP {response.status_code} — {response.text[:300]}")
+            print(f"❌ Gemini HTTP error: {response.status_code} — {response.text[:300]}")
             raise HTTPException(response.status_code, f"Gemini API error: {response.text[:200]}")
 
         data  = response.json()
@@ -438,26 +296,24 @@ async def classify_gemini(file: UploadFile = File(...)):
         if not raw_text:
             raise HTTPException(500, "Empty response from Gemini")
 
-        parsed      = json.loads(raw_text.replace("```json", "").replace("```", "").strip())
-        result_type = parsed.get("type", "ERROR")
-        print(f"[OK]   Gemini classify result: type={result_type}")
+        parsed = json.loads(raw_text.replace("```json", "").replace("```", "").strip())
 
-        if result_type == "NOT_SKIN":
+        if parsed.get("type") == "NOT_SKIN":
             return JSONResponse({
                 "type":   "NOT_SKIN",
                 "reason": parsed.get("reason", "Not human skin")
             })
 
-        if result_type == "HEALTHY":
+        if parsed.get("type") == "HEALTHY":
             return JSONResponse({"type": "HEALTHY"})
 
-        if result_type == "CONDITION":
+        if parsed.get("type") == "CONDITION":
             return JSONResponse({
                 "type":            "CONDITION",
                 "label":           parsed.get("label", "Skin Condition"),
                 "alsoKnownAs":     parsed.get("alsoKnownAs", parsed.get("label", "")),
                 "confidence":      float(parsed.get("confidence", 0.70)),
-                "severity":        parsed.get("severity", "mild") if parsed.get("severity") in ["mild", "moderate", "severe"] else "mild",
+                "severity":        parsed.get("severity", "mild") if parsed.get("severity") in ["mild","moderate","severe"] else "mild",
                 "explanation":     parsed.get("explanation", ""),
                 "symptoms":        parsed.get("symptoms", []) if isinstance(parsed.get("symptoms"), list) else [],
                 "causes":          parsed.get("causes", [])   if isinstance(parsed.get("causes"),   list) else [],
@@ -469,15 +325,104 @@ async def classify_gemini(file: UploadFile = File(...)):
         return JSONResponse({"type": "ERROR"})
 
     except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON parse failed (Gemini classify): {e}")
+        print(f"❌ JSON parse error from Gemini: {e}")
         return JSONResponse({"type": "ERROR"})
     except httpx.TimeoutException:
         raise HTTPException(504, "Gemini request timed out")
     except httpx.RequestError as e:
         raise HTTPException(503, f"Network error reaching Gemini: {str(e)}")
     except Exception as e:
-        print(f"[ERROR] Gemini classify exception: {e}\n{traceback.format_exc()}")
+        print(f"❌ Gemini classify error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Gemini classification failed: {str(e)}")
+
+
+# =========================
+# ONLINE: TFLite Pre-screen → AILABTOOLS API → Groq Info
+# =========================
+@app.post("/classify/online")
+async def classify_online(file: UploadFile = File(...)):
+    try:
+        print(f"📥 Received file: {file.filename}, type: {file.content_type}")
+
+        contents = await file.read()
+        print(f"📦 File size: {len(contents)} bytes")
+
+        if len(contents) == 0:
+            raise HTTPException(400, "Empty file received")
+
+        try:
+            img = Image.open(io.BytesIO(contents)).convert("RGB")
+            print(f"✅ Valid image: {img.format} {img.size}")
+        except Exception as e:
+            raise HTTPException(400, f"Invalid image file: {str(e)}")
+
+        print("🛡️ Running TFLite pre-screen...")
+        prescreen = tflite_prescreen(img)
+
+        if not prescreen["passed"]:
+            print(f"🚫 Pre-screen FAILED [{prescreen['reason']}]")
+            return JSONResponse({
+                "label":         "Not Skin",
+                "confidence":    prescreen["confidence"],
+                "error":         prescreen["reason"],
+                "error_message": prescreen["message"]
+            })
+
+        print("🌐 Pre-screen passed — calling Ailabtools API...")
+        url     = "https://www.ailabapi.com/api/portrait/analysis/skin-disease-detection"
+        headers = { "ailabapi-api-key": AILABTOOLS_API_KEY }
+        files   = { "image": ("photo.jpg", contents, "image/jpeg") }
+
+        async with httpx.AsyncClient(timeout=60.0) as http_client:
+            response = await http_client.post(url, files=files, headers=headers)
+
+        print(f"📡 Ailabtools status: {response.status_code}")
+
+        if response.status_code != 200:
+            error_text = response.text[:500]
+            print(f"❌ Ailabtools error: {error_text}")
+            raise HTTPException(response.status_code, f"Ailabtools API error: {error_text}")
+
+        result     = response.json()
+        error_code = result.get("error_code", 0)
+        if error_code != 0:
+            error_msg = result.get("error_msg", "Unknown error")
+            return JSONResponse({"label": "Not Skin", "confidence": 0.0, "error": "api_error", "error_message": error_msg})
+
+        data    = result.get("data", {})
+        results = data.get("results_english", {})
+
+        if not results:
+            return JSONResponse({"label": "Unknown", "confidence": 0.0, "error": "no_results"})
+
+        best_label      = max(results.items(), key=lambda x: x[1])
+        scientific_name = best_label[0].replace("_", " ").title()
+        confidence      = float(best_label[1])
+        normalized      = normalize_label(scientific_name)
+
+        if normalized not in ["healthy", "not_skin"]:
+            openai_info    = get_skin_info_from_openai(scientific_name)
+            popular_name   = openai_info["alsoKnownAs"]
+            combined_label = f"{scientific_name} - also known as {popular_name}"
+            return JSONResponse({
+                "label":       combined_label,
+                "confidence":  confidence,
+                "all_results": results,
+                "explanation": openai_info["explanation"],
+                "causes":      openai_info["causes"],
+                "dos":         openai_info["dos"],
+                "donts":       openai_info["donts"]
+            })
+        else:
+            return JSONResponse({"label": scientific_name, "confidence": confidence, "all_results": results})
+
+    except httpx.TimeoutException as e:
+        raise HTTPException(504, "Request to Ailabtools timed out")
+    except httpx.RequestError as e:
+        raise HTTPException(503, f"Network error: {str(e)}")
+    except Exception as e:
+        print(f"❌ Error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Classification failed: {str(e)}")
 
 
 # =========================
@@ -485,11 +430,8 @@ async def classify_gemini(file: UploadFile = File(...)):
 # =========================
 @app.post("/classify/offline")
 async def classify_offline(file: UploadFile = File(...)):
-    if interpreter is None:
-        raise HTTPException(503, "Offline classifier unavailable — tflite-runtime not installed on this server.")
-
     try:
-        print(f"[SCAN] Offline classify | file={file.filename}")
+        print(f"📥 Offline: {file.filename}")
 
         contents   = await file.read()
         image      = Image.open(io.BytesIO(contents)).convert("RGB")
@@ -500,9 +442,9 @@ async def classify_offline(file: UploadFile = File(...)):
         output_data = interpreter.get_tensor(output_details["index"])[0]
 
         top3_idx = np.argsort(output_data)[::-1][:3]
-        print("[SCAN] Top 3 predictions:")
+        print("Top 3 predictions:")
         for idx in top3_idx:
-            print(f"       [{idx}] {labels[idx]}: {output_data[idx]:.2%}")
+            print(f"  [{idx}] {labels[idx]}: {output_data[idx]:.2%}")
 
         max_idx    = int(np.argmax(output_data))
         raw_label  = labels[max_idx]
@@ -510,18 +452,18 @@ async def classify_offline(file: UploadFile = File(...)):
         normalized = normalize_label(raw_label)
 
         if confidence < NOT_SKIN_THRESHOLD:
-            return JSONResponse({ "label": "Not Skin",    "confidence": confidence, "error": "low_confidence" })
+            return JSONResponse({ "label": "Not Skin", "confidence": confidence, "error": "low_confidence" })
         if normalized == "not_skin":
-            return JSONResponse({ "label": "Not Skin",    "confidence": confidence, "error": "not_skin" })
+            return JSONResponse({ "label": "Not Skin", "confidence": confidence, "error": "not_skin" })
         if normalized == "healthy":
-            return JSONResponse({ "label": "Healthy Skin","confidence": confidence })
+            return JSONResponse({ "label": "Healthy Skin", "confidence": confidence })
         if confidence < CONFIDENCE_THRESHOLD:
-            return JSONResponse({ "label": normalized,    "confidence": confidence, "warning": "low_confidence_result" })
+            return JSONResponse({ "label": normalized, "confidence": confidence, "warning": "low_confidence_result" })
 
         return JSONResponse({ "label": normalized, "confidence": confidence })
 
     except Exception as e:
-        print(f"[ERROR] Offline classify failed: {e}")
+        print(f"❌ Offline error: {e}")
         print(traceback.format_exc())
         raise HTTPException(500, f"Offline failed: {str(e)}")
 
@@ -530,9 +472,11 @@ async def classify_offline(file: UploadFile = File(...)):
 # UNIFIED ENDPOINT
 # =========================
 @app.post("/classify")
-async def classify_unified(file: UploadFile = File(...), mode: str = Form("gemini")):
-    print(f"[ROUTE] Mode: {mode}")
-    if mode.lower() == "gemini":
+async def classify_unified(file: UploadFile = File(...), mode: str = Form("online")):
+    print(f"📍 Mode: {mode}")
+    if mode.lower() == "online":
+        return await classify_online(file)
+    elif mode.lower() == "gemini":
         return await classify_gemini(file)
     else:
         return await classify_offline(file)
@@ -548,7 +492,7 @@ class ChatRequest(BaseModel):
 @app.post("/chat")
 def chat(req: ChatRequest):
     try:
-        print(f"[CHAT] Message: {req.message[:50]}...")
+        print(f"💬 Chat: {req.message[:50]}...")
 
         messages = [
             {
@@ -589,13 +533,10 @@ def chat(req: ChatRequest):
         return {"reply": reply}
 
     except Exception as e:
-        print(f"[ERROR] Chat failed: {e}")
+        print(f"❌ Chat error: {e}")
         raise HTTPException(500, f"Chat failed: {str(e)}")
 
 
-# =========================
-# EXPLAIN RESULT
-# =========================
 class ExplainRequest(BaseModel):
     label: str
 
@@ -603,7 +544,6 @@ class ExplainRequest(BaseModel):
 def explain_result(req: ExplainRequest):
     try:
         condition = req.label.lower().strip()
-        print(f"[EXPLAIN] Label: {req.label}")
 
         if "not skin" in condition:
             return {
@@ -650,39 +590,35 @@ def explain_result(req: ExplainRequest):
         }
 
     except Exception as e:
-        print(f"[ERROR] Explain failed: {e}")
+        print(f"❌ Explain error: {e}")
         raise HTTPException(500, f"Explanation failed: {str(e)}")
 
 
-# =========================
-# HEALTH / DEBUG
-# =========================
 @app.get("/")
 def health():
     return {
         "status":  "ok",
-        "service": "DermAware Backend v3.3",
+        "service": "DermAware Backend v3.2",
         "features": [
-            "Gemini Vision - skin classification (server-side key)",
-            "Gemini Vision - GCash screenshot verification (server-side key)",
-            "TFLite Pre-screen (offline fallback)",
+            "Gemini Vision (server-side, key hidden)",
+            "TFLite Pre-screen (protects API credits)",
             "DermNet 23 Classes",
-            "Scientific + Popular Names via Groq",
-            "AI Chat (Groq)",
+            "Scientific + Popular Names",
+            "Improved Offline"
         ],
-        "gemini": "OK"          if GEMINI_API_KEY            else "MISSING",
-        "groq":   "OK"          if os.getenv("GROQ_API_KEY") else "MISSING",
-        "tflite": "OK"          if interpreter is not None   else "UNAVAILABLE",
+        "gemini":        "✅" if GEMINI_API_KEY else "❌",
+        "ailabtools":    "✅" if AILABTOOLS_API_KEY else "❌",
+        "groq":          "✅" if os.getenv("GROQ_API_KEY") else "❌",
+        "tflite":        "✅",
         "model_classes": len(labels),
         "endpoints": {
-            "health":          "GET  /",
-            "debug":           "GET  /debug",
-            "classify_gemini": "POST /classify/gemini    - Gemini skin analysis",
-            "classify_offline":"POST /classify/offline   - TFLite offline",
-            "classify_unified":"POST /classify           - Auto-routes (default: gemini)",
-            "gcash_verify":    "POST /verify/gcash-screenshot - GCash receipt AI check",
-            "chat":            "POST /chat",
-            "explain":         "POST /explain_result",
+            "health":        "GET /",
+            "gemini":        "POST /classify/gemini  ← NEW: Gemini vision, key server-side",
+            "online":        "POST /classify/online",
+            "offline":       "POST /classify/offline",
+            "unified":       "POST /classify",
+            "chat":          "POST /chat",
+            "explain":       "POST /explain_result",
         }
     }
 
@@ -699,11 +635,11 @@ def ui():
 @app.get("/debug")
 def debug():
     return {
-        "gemini_key":   "OK - Set"   if GEMINI_API_KEY            else "MISSING",
-        "groq_key":     "OK - Set"   if os.getenv("GROQ_API_KEY") else "MISSING",
-        "tflite":       "OK"         if interpreter is not None   else "UNAVAILABLE - add tflite-runtime to requirements.txt",
-        "labels_count": len(labels),
-        "sample_labels":labels[:5],
+        "gemini_key":     "✅ Set" if GEMINI_API_KEY else "❌ Missing",
+        "ailabtools_key": "✅ Set" if AILABTOOLS_API_KEY else "❌ Missing",
+        "groq_key":       "✅ Set" if os.getenv("GROQ_API_KEY") else "❌ Missing",
+        "labels_count":   len(labels),
+        "sample_labels":  labels[:5],
     }
 
 
@@ -713,15 +649,11 @@ def debug():
 if __name__ == "__main__":
     import uvicorn
     local_ip = get_local_ip()
-    tflite_status = f"[OK] ({len(labels)} classes)" if interpreter else "[UNAVAILABLE] install tflite-runtime"
-    print("=" * 52)
-    print("  DermAware Backend v3.3")
-    print("=" * 52)
-    print(f"  Local Network : http://{local_ip}:8000")
-    print(f"  Localhost     : http://127.0.0.1:8000")
-    print(f"  Gemini        : {'[OK]' if GEMINI_API_KEY else '[MISSING] set GEMINI_API_KEY'}")
-    print(f"  Groq          : {'[OK]' if os.getenv('GROQ_API_KEY') else '[MISSING] set GROQ_API_KEY'}")
-    print(f"  TFLite        : {tflite_status}")
-    print("=" * 52)
+    print("DermAware Backend v3.2 Starting...")
+    print(f"Local Network: http://{local_ip}:8000")
+    print(f"Localhost:    http://127.0.0.1:8000")
+    print(f"Gemini:      {'✅' if GEMINI_API_KEY else '❌ Missing GEMINI_API_KEY'}")
+    print(f"Ailabtools:  {'✅' if AILABTOOLS_API_KEY else '❌'}")
+    print(f"Groq:        {'✅' if os.getenv('GROQ_API_KEY') else '❌'}")
+    print(f"TFLite: ✅ ({len(labels)} classes)")
     uvicorn.run(app, host="0.0.0.0", port=8000)
-        
