@@ -5,7 +5,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
 import numpy as np
-import tflite_runtime.interpreter as tflite
+try:
+    from ai_edge_litert.interpreter import Interpreter
+except ModuleNotFoundError:
+    try:
+        from tflite_runtime.interpreter import Interpreter
+    except ModuleNotFoundError:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
 import os
 from groq import Groq
 from dotenv import load_dotenv
@@ -38,7 +45,7 @@ GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 # =========================
 # Load TFLite model (for OFFLINE mode + PRE-SCREENING)
 # =========================
-interpreter = tflite.Interpreter(model_path="model_unquant.tflite")
+interpreter = Interpreter(model_path="model_unquant.tflite")
 interpreter.allocate_tensors()
 
 input_details  = interpreter.get_input_details()[0]
@@ -150,7 +157,7 @@ def tflite_prescreen(image: Image.Image) -> dict:
 
 def get_skin_info_from_openai(label: str):
     try:
-        print(f"🤖 Asking Groq for details about: {label}")
+        print(f"Asking Groq for details about: {label}")
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -187,7 +194,7 @@ def get_skin_info_from_openai(label: str):
             "donts":       data.get("donts", [])
         }
     except Exception as e:
-        print(f"❌ Error getting Groq info: {e}")
+        print(f"Error getting Groq info: {e}")
         return {
             "alsoKnownAs": label,
             "explanation": "Information currently unavailable.",
@@ -199,15 +206,9 @@ def get_skin_info_from_openai(label: str):
 
 # =========================
 # GEMINI CLASSIFICATION ENDPOINT
-# Keeps API key server-side — never exposed to the mobile app
 # =========================
 @app.post("/classify/gemini")
 async def classify_gemini(file: UploadFile = File(...)):
-    """
-    Gemini-powered skin analysis.
-    The mobile app sends the image file here; this endpoint calls Gemini
-    so the API key stays securely on the server.
-    """
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY not configured on server")
 
@@ -216,7 +217,6 @@ async def classify_gemini(file: UploadFile = File(...)):
         if len(contents) == 0:
             raise HTTPException(400, "Empty file received")
 
-        # Validate image
         try:
             Image.open(io.BytesIO(contents)).convert("RGB")
         except Exception as e:
@@ -287,7 +287,6 @@ async def classify_gemini(file: UploadFile = File(...)):
         data  = response.json()
         parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
 
-        # Filter out thinking parts, get last text part
         raw_text = (
             next((p["text"] for p in reversed(parts) if not p.get("thought") and "text" in p), None)
             or (parts[-1].get("text", "") if parts else "")
@@ -334,6 +333,100 @@ async def classify_gemini(file: UploadFile = File(...)):
     except Exception as e:
         print(f"❌ Gemini classify error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Gemini classification failed: {str(e)}")
+
+
+# =========================
+# GCASH SCREENSHOT VERIFICATION
+# =========================
+class GCashVerifyRequest(BaseModel):
+    image_base64:    str
+    mime_type:       str = "image/jpeg"
+    expected_amount: str = "₱149"
+
+@app.post("/verify/gcash-screenshot")
+async def verify_gcash_screenshot(req: GCashVerifyRequest):
+    if not GEMINI_API_KEY:
+        raise HTTPException(500, "GEMINI_API_KEY not configured")
+    try:
+        # Strip data URI prefix if present
+        raw_b64 = req.image_base64
+        if "," in raw_b64:
+            raw_b64 = raw_b64.split(",", 1)[1]
+
+        prompt = (
+            "You are a GCash payment receipt verifier. Analyze this image and respond ONLY in JSON.\n\n"
+            "{\n"
+            "  \"isGcash\": true or false,\n"
+            "  \"confidence\": \"high\" or \"medium\" or \"low\",\n"
+            "  \"extractedRef\": \"13-digit reference number or null\",\n"
+            "  \"extractedAmount\": \"amount shown e.g. ₱149.00 or null\",\n"
+            "  \"amountMatches\": true or false or null,\n"
+            "  \"reason\": \"brief explanation\"\n"
+            "}\n\n"
+            f"Expected amount: {req.expected_amount}\n\n"
+            "Rules:\n"
+            "- isGcash: true only if this is clearly a GCash transaction receipt/screenshot\n"
+            "- extractedRef: find the 13-digit reference/transaction number (digits only, no spaces)\n"
+            "- extractedAmount: the exact amount shown in the receipt\n"
+            "- amountMatches: compare extractedAmount to expected amount (null if cannot determine)\n"
+            "- confidence: high=clearly a gcash receipt, medium=looks like one, low=unclear or unreadable\n"
+            "- reason: short explanation of your decision\n"
+            "Return ONLY valid JSON, no markdown fences, no extra text."
+        )
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": req.mime_type, "data": raw_b64}}
+                ]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": 300,
+                "temperature": 0.1,
+                "thinkingConfig": {"thinkingBudget": 0}
+            }
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            response = await http_client.post(GEMINI_URL, json=payload)
+
+        if response.status_code != 200:
+            raise HTTPException(response.status_code, f"Gemini error: {response.text[:200]}")
+
+        data  = response.json()
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        raw_text = (
+            next((p["text"] for p in reversed(parts) if not p.get("thought") and "text" in p), None)
+            or (parts[-1].get("text", "") if parts else "")
+        ).strip()
+
+        if not raw_text:
+            raise HTTPException(500, "Empty response from Gemini")
+
+        result = json.loads(raw_text.replace("```json", "").replace("```", "").strip())
+
+        return JSONResponse({
+            "isGcash":         bool(result.get("isGcash", False)),
+            "confidence":      result.get("confidence", "low"),
+            "extractedRef":    result.get("extractedRef", None),
+            "extractedAmount": result.get("extractedAmount", None),
+            "amountMatches":   result.get("amountMatches", None),
+            "reason":          result.get("reason", "Could not verify"),
+        })
+
+    except json.JSONDecodeError:
+        return JSONResponse({
+            "isGcash":         False,
+            "confidence":      "low",
+            "extractedRef":    None,
+            "extractedAmount": None,
+            "amountMatches":   None,
+            "reason":          "Could not parse AI response"
+        })
+    except Exception as e:
+        print(f"❌ GCash verify error: {e}\n{traceback.format_exc()}")
+        raise HTTPException(500, f"Verification failed: {str(e)}")
 
 
 # =========================
@@ -604,7 +697,8 @@ def health():
             "TFLite Pre-screen (protects API credits)",
             "DermNet 23 Classes",
             "Scientific + Popular Names",
-            "Improved Offline"
+            "Improved Offline",
+            "GCash Screenshot Verification"
         ],
         "gemini":        "✅" if GEMINI_API_KEY else "❌",
         "ailabtools":    "✅" if AILABTOOLS_API_KEY else "❌",
@@ -612,13 +706,14 @@ def health():
         "tflite":        "✅",
         "model_classes": len(labels),
         "endpoints": {
-            "health":        "GET /",
-            "gemini":        "POST /classify/gemini  ← NEW: Gemini vision, key server-side",
-            "online":        "POST /classify/online",
-            "offline":       "POST /classify/offline",
-            "unified":       "POST /classify",
-            "chat":          "POST /chat",
-            "explain":       "POST /explain_result",
+            "health":         "GET /",
+            "gemini":         "POST /classify/gemini",
+            "online":         "POST /classify/online",
+            "offline":        "POST /classify/offline",
+            "unified":        "POST /classify",
+            "chat":           "POST /chat",
+            "explain":        "POST /explain_result",
+            "gcash_verify":   "POST /verify/gcash-screenshot",
         }
     }
 
