@@ -31,11 +31,6 @@ load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # =========================
-# AILABTOOLS CONFIG
-# =========================
-AILABTOOLS_API_KEY = os.getenv("AILABTOOLS_API_KEY")
-
-# =========================
 # GEMINI CONFIG
 # =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -430,95 +425,6 @@ async def verify_gcash_screenshot(req: GCashVerifyRequest):
 
 
 # =========================
-# ONLINE: TFLite Pre-screen → AILABTOOLS API → Groq Info
-# =========================
-@app.post("/classify/online")
-async def classify_online(file: UploadFile = File(...)):
-    try:
-        print(f"📥 Received file: {file.filename}, type: {file.content_type}")
-
-        contents = await file.read()
-        print(f"📦 File size: {len(contents)} bytes")
-
-        if len(contents) == 0:
-            raise HTTPException(400, "Empty file received")
-
-        try:
-            img = Image.open(io.BytesIO(contents)).convert("RGB")
-            print(f"✅ Valid image: {img.format} {img.size}")
-        except Exception as e:
-            raise HTTPException(400, f"Invalid image file: {str(e)}")
-
-        print("🛡️ Running TFLite pre-screen...")
-        prescreen = tflite_prescreen(img)
-
-        if not prescreen["passed"]:
-            print(f"🚫 Pre-screen FAILED [{prescreen['reason']}]")
-            return JSONResponse({
-                "label":         "Not Skin",
-                "confidence":    prescreen["confidence"],
-                "error":         prescreen["reason"],
-                "error_message": prescreen["message"]
-            })
-
-        print("🌐 Pre-screen passed — calling Ailabtools API...")
-        url     = "https://www.ailabapi.com/api/portrait/analysis/skin-disease-detection"
-        headers = { "ailabapi-api-key": AILABTOOLS_API_KEY }
-        files   = { "image": ("photo.jpg", contents, "image/jpeg") }
-
-        async with httpx.AsyncClient(timeout=60.0) as http_client:
-            response = await http_client.post(url, files=files, headers=headers)
-
-        print(f"📡 Ailabtools status: {response.status_code}")
-
-        if response.status_code != 200:
-            error_text = response.text[:500]
-            print(f"❌ Ailabtools error: {error_text}")
-            raise HTTPException(response.status_code, f"Ailabtools API error: {error_text}")
-
-        result     = response.json()
-        error_code = result.get("error_code", 0)
-        if error_code != 0:
-            error_msg = result.get("error_msg", "Unknown error")
-            return JSONResponse({"label": "Not Skin", "confidence": 0.0, "error": "api_error", "error_message": error_msg})
-
-        data    = result.get("data", {})
-        results = data.get("results_english", {})
-
-        if not results:
-            return JSONResponse({"label": "Unknown", "confidence": 0.0, "error": "no_results"})
-
-        best_label      = max(results.items(), key=lambda x: x[1])
-        scientific_name = best_label[0].replace("_", " ").title()
-        confidence      = float(best_label[1])
-        normalized      = normalize_label(scientific_name)
-
-        if normalized not in ["healthy", "not_skin"]:
-            openai_info    = get_skin_info_from_openai(scientific_name)
-            popular_name   = openai_info["alsoKnownAs"]
-            combined_label = f"{scientific_name} - also known as {popular_name}"
-            return JSONResponse({
-                "label":       combined_label,
-                "confidence":  confidence,
-                "all_results": results,
-                "explanation": openai_info["explanation"],
-                "causes":      openai_info["causes"],
-                "dos":         openai_info["dos"],
-                "donts":       openai_info["donts"]
-            })
-        else:
-            return JSONResponse({"label": scientific_name, "confidence": confidence, "all_results": results})
-
-    except httpx.TimeoutException as e:
-        raise HTTPException(504, "Request to Ailabtools timed out")
-    except httpx.RequestError as e:
-        raise HTTPException(503, f"Network error: {str(e)}")
-    except Exception as e:
-        print(f"❌ Error: {e}\n{traceback.format_exc()}")
-        raise HTTPException(500, f"Classification failed: {str(e)}")
-
-
-# =========================
 # OFFLINE: TFLite Direct Classifier
 # =========================
 @app.post("/classify/offline")
@@ -565,11 +471,9 @@ async def classify_offline(file: UploadFile = File(...)):
 # UNIFIED ENDPOINT
 # =========================
 @app.post("/classify")
-async def classify_unified(file: UploadFile = File(...), mode: str = Form("online")):
+async def classify_unified(file: UploadFile = File(...), mode: str = Form("gemini")):
     print(f"📍 Mode: {mode}")
-    if mode.lower() == "online":
-        return await classify_online(file)
-    elif mode.lower() == "gemini":
+    if mode.lower() in ("online", "gemini"):
         return await classify_gemini(file)
     else:
         return await classify_offline(file)
@@ -701,14 +605,12 @@ def health():
             "GCash Screenshot Verification"
         ],
         "gemini":        "✅" if GEMINI_API_KEY else "❌",
-        "ailabtools":    "✅" if AILABTOOLS_API_KEY else "❌",
         "groq":          "✅" if os.getenv("GROQ_API_KEY") else "❌",
         "tflite":        "✅",
         "model_classes": len(labels),
         "endpoints": {
             "health":         "GET /",
             "gemini":         "POST /classify/gemini",
-            "online":         "POST /classify/online",
             "offline":        "POST /classify/offline",
             "unified":        "POST /classify",
             "chat":           "POST /chat",
@@ -730,11 +632,10 @@ def ui():
 @app.get("/debug")
 def debug():
     return {
-        "gemini_key":     "✅ Set" if GEMINI_API_KEY else "❌ Missing",
-        "ailabtools_key": "✅ Set" if AILABTOOLS_API_KEY else "❌ Missing",
-        "groq_key":       "✅ Set" if os.getenv("GROQ_API_KEY") else "❌ Missing",
-        "labels_count":   len(labels),
-        "sample_labels":  labels[:5],
+        "gemini_key":   "✅ Set" if GEMINI_API_KEY else "❌ Missing",
+        "groq_key":     "✅ Set" if os.getenv("GROQ_API_KEY") else "❌ Missing",
+        "labels_count": len(labels),
+        "sample_labels": labels[:5],
     }
 
 
@@ -748,7 +649,6 @@ if __name__ == "__main__":
     print(f"Local Network: http://{local_ip}:8000")
     print(f"Localhost:    http://127.0.0.1:8000")
     print(f"Gemini:      {'✅' if GEMINI_API_KEY else '❌ Missing GEMINI_API_KEY'}")
-    print(f"Ailabtools:  {'✅' if AILABTOOLS_API_KEY else '❌'}")
     print(f"Groq:        {'✅' if os.getenv('GROQ_API_KEY') else '❌'}")
     print(f"TFLite: ✅ ({len(labels)} classes)")
     uvicorn.run(app, host="0.0.0.0", port=8000)
