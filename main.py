@@ -25,28 +25,18 @@ import base64 as b64lib
 
 load_dotenv()
 
-# =========================
-# AI CHAT (Groq)
-# =========================
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# =========================
-# GEMINI CONFIG
-# =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL   = "gemini-2.5-flash-lite"
 GEMINI_URL     = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
-# =========================
-# Load TFLite model (for OFFLINE mode + PRE-SCREENING)
-# =========================
 interpreter = Interpreter(model_path="model_unquant.tflite")
 interpreter.allocate_tensors()
 
 input_details  = interpreter.get_input_details()[0]
 output_details = interpreter.get_output_details()[0]
 
-# Load labels
 with open("labels.txt") as f:
     labels = [line.strip() for line in f.readlines()]
 
@@ -60,12 +50,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static files (UI)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# =========================
-# Thresholds
-# =========================
 CONFIDENCE_THRESHOLD = 0.40
 NOT_SKIN_THRESHOLD   = 0.30
 
@@ -79,9 +65,6 @@ NOT_SKIN_LABELS = {
     "no skin", "other"
 }
 
-# =========================
-# Utils
-# =========================
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -106,9 +89,6 @@ def normalize_label(label: str) -> str:
         return "not_skin"
     return label.replace("-", " ").replace("_", " ").title()
 
-# =========================
-# TFLite Pre-screen
-# =========================
 def tflite_prescreen(image: Image.Image) -> dict:
     try:
         input_data = preprocess_image(image)
@@ -198,10 +178,6 @@ def get_skin_info_from_openai(label: str):
             "donts":       []
         }
 
-
-# =========================
-# GEMINI CLASSIFICATION ENDPOINT
-# =========================
 @app.post("/classify/gemini")
 async def classify_gemini(file: UploadFile = File(...)):
     if not GEMINI_API_KEY:
@@ -329,10 +305,6 @@ async def classify_gemini(file: UploadFile = File(...)):
         print(f"❌ Gemini classify error: {e}\n{traceback.format_exc()}")
         raise HTTPException(500, f"Gemini classification failed: {str(e)}")
 
-
-# =========================
-# GCASH SCREENSHOT VERIFICATION
-# =========================
 class GCashVerifyRequest(BaseModel):
     image_base64:    str
     mime_type:       str = "image/jpeg"
@@ -343,7 +315,6 @@ async def verify_gcash_screenshot(req: GCashVerifyRequest):
     if not GEMINI_API_KEY:
         raise HTTPException(500, "GEMINI_API_KEY not configured")
     try:
-        # Strip data URI prefix if present
         raw_b64 = req.image_base64
         if "," in raw_b64:
             raw_b64 = raw_b64.split(",", 1)[1]
@@ -424,9 +395,6 @@ async def verify_gcash_screenshot(req: GCashVerifyRequest):
         raise HTTPException(500, f"Verification failed: {str(e)}")
 
 
-# =========================
-# OFFLINE: TFLite Direct Classifier
-# =========================
 @app.post("/classify/offline")
 async def classify_offline(file: UploadFile = File(...)):
     try:
@@ -467,9 +435,6 @@ async def classify_offline(file: UploadFile = File(...)):
         raise HTTPException(500, f"Offline failed: {str(e)}")
 
 
-# =========================
-# UNIFIED ENDPOINT
-# =========================
 @app.post("/classify")
 async def classify_unified(file: UploadFile = File(...), mode: str = Form("gemini")):
     print(f"📍 Mode: {mode}")
@@ -478,10 +443,6 @@ async def classify_unified(file: UploadFile = File(...), mode: str = Form("gemin
     else:
         return await classify_offline(file)
 
-
-# =========================
-# AI CHAT — With Conversation History
-# =========================
 class ChatRequest(BaseModel):
     message: str
     history: list = []
@@ -638,10 +599,6 @@ def debug():
         "sample_labels": labels[:5],
     }
 
-
-# =========================
-# RUN
-# =========================
 if __name__ == "__main__":
     import uvicorn
     local_ip = get_local_ip()
